@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { Loader2, Save, Trash2, ChevronDown, ChevronUp, AlertCircle, Github } from 'lucide-react';
 import { db } from '../../db/database';
-import { parseProfilerFile } from '../../lib/profilerParser';
+import { mergeAnalyses } from '../../lib/profilerParser';
 import {
   isGitHubConfigured,
   loadProfilesFromGitHub,
@@ -253,12 +253,13 @@ function SavedProfileRow({
 
 // ─── Main tab ─────────────────────────────────────────────────────────────────
 export default function ProfilerAnalyzer() {
-  const [analysis, setAnalysis] = useState<ProfileAnalysis | null>(null);
-  const [loading,  setLoading]  = useState(false);
-  const [error,    setError]    = useState<string | null>(null);
-  const [saving,   setSaving]   = useState(false);
-  const [savedId,  setSavedId]  = useState<number | null>(null);
-  const [ghSyncing, setGhSyncing] = useState(false);
+  const [analysis,    setAnalysis]    = useState<ProfileAnalysis | null>(null);
+  const [loading,     setLoading]     = useState(false);
+  const [error,       setError]       = useState<string | null>(null);
+  const [saving,      setSaving]      = useState(false);
+  const [savedId,     setSavedId]     = useState<number | null>(null);
+  const [ghSyncing,   setGhSyncing]   = useState(false);
+  const [zipProgress, setZipProgress] = useState<{ current: number; total: number; currentFile: string } | null>(null);
 
   const savedProfiles = useLiveQuery(() => db.profiles.orderBy('uploadedAt').reverse().toArray(), []);
 
@@ -276,20 +277,137 @@ export default function ProfilerAnalyzer() {
     }).catch(() => { /* silencioso si no hay conexión */ });
   }, []);
 
+  // ── Spawn a short-lived worker so large files don't freeze the UI ──────────
+  function runWorker(buffer: ArrayBuffer, fileName: string): Promise<ProfileAnalysis> {
+    return new Promise((resolve, reject) => {
+      const worker = new Worker(
+        new URL('../../lib/profilerWorker.ts', import.meta.url),
+        { type: 'module' },
+      );
+      worker.onmessage = (e: MessageEvent<{ ok: boolean; result?: ProfileAnalysis; error?: string }>) => {
+        worker.terminate();
+        if (e.data.ok && e.data.result) resolve(e.data.result);
+        else reject(new Error(e.data.error ?? 'Worker error'));
+      };
+      worker.onerror = (e) => {
+        worker.terminate();
+        reject(new Error(e.message || 'Worker error'));
+      };
+      // Transfer ownership of the buffer (zero-copy)
+      worker.postMessage({ buffer, fileName }, [buffer]);
+    });
+  }
+
+  // ── Process a single non-ZIP file via worker ──────────────────────────────
+  async function handleRegularFile(file: File): Promise<ProfileAnalysis> {
+    const buffer = await file.arrayBuffer();
+    return runWorker(buffer, file.name);
+  }
+
+  // ── Process a ZIP that can contain multiple profiler files ────────────────
+  async function handleZipFile(file: File): Promise<ProfileAnalysis> {
+    const JSZip = (await import('jszip')).default;
+    const zip   = await JSZip.loadAsync(file);
+
+    // Filter to JSON / no-extension / profiler-named entries, skip directories
+    const entries = Object.entries(zip.files)
+      .filter(([, f]) => !f.dir)
+      .filter(([name]) => {
+        const lower = name.toLowerCase();
+        const base  = lower.split('/').pop() ?? lower;
+        return (
+          base.endsWith('.json')    ||
+          base.endsWith('.profile') ||
+          /profil/i.test(base)      ||
+          !base.includes('.')        // no extension = FiveM saveJSON format
+        );
+      })
+      .sort((a, b) => a[0].localeCompare(b[0]));
+
+    if (entries.length === 0) {
+      throw new Error(
+        'El ZIP no contiene archivos de profiler reconocibles (.json, .profile o sin extensión).',
+      );
+    }
+
+    const analyses: ProfileAnalysis[] = [];
+    setZipProgress({ current: 0, total: entries.length, currentFile: '' });
+
+    for (let i = 0; i < entries.length; i++) {
+      const [path, zipEntry] = entries[i];
+      const baseName = path.split('/').pop() ?? path;
+      setZipProgress({ current: i + 1, total: entries.length, currentFile: baseName });
+
+      try {
+        const buffer = await zipEntry.async('arraybuffer');
+        const result = await runWorker(buffer, baseName);
+        analyses.push(result);
+      } catch {
+        // Skip non-profiler files silently
+      }
+    }
+
+    if (analyses.length === 0) {
+      throw new Error('Ningún archivo en el ZIP pudo ser analizado como profiler de FiveM.');
+    }
+
+    setZipProgress({ current: entries.length, total: entries.length, currentFile: '' });
+    return mergeAnalyses(analyses, file.name);
+  }
+
   async function handleFile(file: File) {
     setLoading(true);
     setError(null);
     setAnalysis(null);
     setSavedId(null);
+    setZipProgress(null);
     try {
-      const text = await file.text();
-      const json = JSON.parse(text) as unknown;
-      const result = parseProfilerFile(json, file.name);
+      const lower = file.name.toLowerCase();
+
+      // ── Detect unsupported archive formats by magic bytes + extension ──
+      const header = new Uint8Array(await file.slice(0, 8).arrayBuffer());
+      const isRar  =
+        lower.endsWith('.rar') ||
+        (header[0] === 0x52 && header[1] === 0x61 && header[2] === 0x72 && header[3] === 0x21); // "Rar!"
+      const is7z   =
+        lower.endsWith('.7z') ||
+        (header[0] === 0x37 && header[1] === 0x7A && header[2] === 0xBC && header[3] === 0xAF); // "7z"
+      const isGz   = lower.endsWith('.gz') || lower.endsWith('.tar.gz') ||
+                     (header[0] === 0x1F && header[1] === 0x8B);
+
+      if (isRar) {
+        throw new Error(
+          'El formato .rar no está soportado por el navegador. ' +
+          'Por favor, abre el .rar con WinRAR / 7-Zip y vuelve a comprimirlo como .zip, ' +
+          'o sube los archivos de profiler directamente sin comprimir.',
+        );
+      }
+      if (is7z) {
+        throw new Error(
+          'El formato .7z no está soportado. Comprime los archivos como .zip en su lugar.',
+        );
+      }
+      if (isGz) {
+        throw new Error(
+          'El formato .gz / .tar.gz no está soportado. Comprime los archivos como .zip en su lugar.',
+        );
+      }
+
+      const isZip =
+        lower.endsWith('.zip')                        ||
+        file.type === 'application/zip'               ||
+        file.type === 'application/x-zip-compressed'  ||
+        (header[0] === 0x50 && header[1] === 0x4B);   // PK magic bytes
+
+      const result = isZip
+        ? await handleZipFile(file)
+        : await handleRegularFile(file);
       setAnalysis(result);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Error al procesar el archivo.');
     } finally {
       setLoading(false);
+      setZipProgress(null);
     }
   }
 
@@ -363,6 +481,7 @@ export default function ProfilerAnalyzer() {
             <li>En tu consola txAdmin, ejecuta: <code className="tag bg-zinc-800 text-accent">profiler record 300</code> (graba 300 ticks)</li>
             <li>Espera a que termine, luego ejecuta: <code className="tag bg-zinc-800 text-accent">profiler saveJSON myprofile</code></li>
             <li>Descarga el archivo <code className="tag bg-zinc-800 text-zinc-300">myprofile</code> (sin extensión) desde la carpeta <code className="tag bg-zinc-800 text-zinc-300">resources/</code> de tu servidor y súbelo aquí.</li>
+            <li>Opcional: mete varios archivos de profiler en un <code className="tag bg-zinc-800 text-accent">.zip</code> — todos se analizarán y combinarán automáticamente (ideal para 1&nbsp;GB+ de datos).</li>
           </ol>
         </div>
       )}
@@ -373,15 +492,35 @@ export default function ProfilerAnalyzer() {
           onFile={handleFile}
           accept="*"
           label="Arrastra tu profiler file aquí"
-          hint="o haz clic para explorar · .json o sin extensión (myprofile) ambos funcionan"
+          hint="o haz clic · .json, sin extensión, o .zip con múltiples perfiles"
         />
       )}
 
       {/* Loading */}
       {loading && (
-        <div className="flex flex-col items-center justify-center gap-3 py-16">
+        <div className="flex flex-col items-center justify-center gap-4 py-16">
           <Loader2 className="h-10 w-10 animate-spin text-accent" />
-          <p className="text-zinc-400">Analizando profiler…</p>
+          {zipProgress ? (
+            <>
+              <p className="text-zinc-400">Procesando ZIP…</p>
+              {zipProgress.currentFile && (
+                <p className="text-sm text-zinc-500 font-mono truncate max-w-xs">
+                  {zipProgress.currentFile}
+                </p>
+              )}
+              <p className="text-xs text-zinc-600">
+                {zipProgress.current} / {zipProgress.total} archivos
+              </p>
+              <div className="w-64 h-1.5 rounded-full overflow-hidden bg-zinc-800">
+                <div
+                  className="h-full bg-accent transition-all duration-300"
+                  style={{ width: `${(zipProgress.current / zipProgress.total) * 100}%` }}
+                />
+              </div>
+            </>
+          ) : (
+            <p className="text-zinc-400">Analizando profiler…</p>
+          )}
         </div>
       )}
 

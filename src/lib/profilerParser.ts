@@ -279,6 +279,84 @@ function calcGrade(avgMs: number, heavyPct: number): Grade {
   return 'Excellent';
 }
 
+// ─── Build a ProfileAnalysis from an already-computed set of ticks ───────────
+function buildAnalysisFromTicks(ticks: TickData[], fileName: string): ProfileAnalysis {
+  const scriptMap = new Map<
+    string,
+    {
+      name: string;
+      resource: string;
+      totalTime: number;
+      maxTime: number;
+      tickCount: number;
+      heavyTickCount: number;
+    }
+  >();
+
+  for (const tick of ticks) {
+    for (const entry of tick.scripts) {
+      const existing = scriptMap.get(entry.name);
+      if (!existing) {
+        scriptMap.set(entry.name, {
+          name: entry.name,
+          resource: extractResource(entry.name),
+          totalTime: entry.time,
+          maxTime: entry.time,
+          tickCount: 1,
+          heavyTickCount: tick.isHeavy ? 1 : 0,
+        });
+      } else {
+        existing.totalTime += entry.time;
+        existing.maxTime    = Math.max(existing.maxTime, entry.time);
+        existing.tickCount++;
+        if (tick.isHeavy) existing.heavyTickCount++;
+      }
+    }
+  }
+
+  const scripts: ScriptStats[] = Array.from(scriptMap.values()).map((s) => ({
+    ...s,
+    avgTimePerTick: s.totalTime / ticks.length,
+  }));
+
+  const heavyCount    = ticks.filter((t) => t.isHeavy).length;
+  const avgScriptTime = ticks.reduce((s, t) => s + t.totalTime, 0) / ticks.length;
+  const maxScriptTime = ticks.reduce((m, t) => (t.totalTime > m ? t.totalTime : m), 0);
+  const heavyPct      = (heavyCount / ticks.length) * 100;
+
+  return {
+    fileName,
+    uploadedAt: new Date(),
+    tickCount:       ticks.length,
+    heavyTickCount:  heavyCount,
+    avgScriptTime,
+    maxScriptTime,
+    grade: calcGrade(avgScriptTime, heavyPct),
+    ticks,
+    scripts,
+    topCpuHogs:     [...scripts].sort((a, b) => b.totalTime       - a.totalTime).slice(0, 20),
+    topSpikes:      [...scripts].sort((a, b) => b.maxTime         - a.maxTime).slice(0, 20),
+    topHitchDrivers:[...scripts].sort((a, b) => b.heavyTickCount  - a.heavyTickCount).slice(0, 20),
+  };
+}
+
+// ─── Merge several ProfileAnalysis into one combined analysis ─────────────────
+// Useful when a ZIP contains multiple separate profiler recordings.
+export function mergeAnalyses(analyses: ProfileAnalysis[], fileName: string): ProfileAnalysis {
+  if (analyses.length === 1) return { ...analyses[0], fileName };
+
+  // Re-index ticks from every recording sequentially
+  const allTicks: TickData[] = [];
+  let idx = 0;
+  for (const a of analyses) {
+    for (const tick of a.ticks) {
+      allTicks.push({ ...tick, index: idx++ });
+    }
+  }
+
+  return buildAnalysisFromTicks(allTicks, fileName);
+}
+
 // ─── Main export ─────────────────────────────────────────────────────────────
 export function parseProfilerFile(json: unknown, fileName: string): ProfileAnalysis {
   const rawMarkers = parseMarkers(json);
@@ -311,65 +389,5 @@ export function parseProfilerFile(json: unknown, fileName: string): ProfileAnaly
     };
   });
 
-  // ── Aggregate per-script stats across all ticks ──
-  const scriptMap = new Map<
-    string,
-    {
-      name: string;
-      resource: string;
-      totalTime: number;
-      maxTime: number;
-      tickCount: number;
-      heavyTickCount: number;
-    }
-  >();
-
-  for (const tick of ticks) {
-    for (const entry of tick.scripts) {
-      const existing = scriptMap.get(entry.name);
-      if (!existing) {
-        scriptMap.set(entry.name, {
-          name: entry.name,
-          resource: extractResource(entry.name),
-          totalTime: entry.time,
-          maxTime: entry.time,
-          tickCount: 1,
-          heavyTickCount: tick.isHeavy ? 1 : 0,
-        });
-      } else {
-        existing.totalTime += entry.time;
-        existing.maxTime = Math.max(existing.maxTime, entry.time);
-        existing.tickCount++;
-        if (tick.isHeavy) existing.heavyTickCount++;
-      }
-    }
-  }
-
-  const scripts: ScriptStats[] = Array.from(scriptMap.values()).map((s) => ({
-    ...s,
-    avgTimePerTick: s.totalTime / ticks.length,
-  }));
-
-  const heavyCount = ticks.filter((t) => t.isHeavy).length;
-  const avgScriptTime =
-    ticks.reduce((s, t) => s + t.totalTime, 0) / ticks.length;
-  const maxScriptTime = Math.max(...ticks.map((t) => t.totalTime));
-  const heavyPct = (heavyCount / ticks.length) * 100;
-
-  return {
-    fileName,
-    uploadedAt: new Date(),
-    tickCount: ticks.length,
-    heavyTickCount: heavyCount,
-    avgScriptTime,
-    maxScriptTime,
-    grade: calcGrade(avgScriptTime, heavyPct),
-    ticks,
-    scripts,
-    topCpuHogs: [...scripts].sort((a, b) => b.totalTime - a.totalTime).slice(0, 20),
-    topSpikes: [...scripts].sort((a, b) => b.maxTime - a.maxTime).slice(0, 20),
-    topHitchDrivers: [...scripts]
-      .sort((a, b) => b.heavyTickCount - a.heavyTickCount)
-      .slice(0, 20),
-  };
+  return buildAnalysisFromTicks(ticks, fileName);
 }
