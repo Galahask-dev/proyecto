@@ -1,11 +1,16 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import {
   Loader2, Save, Trash2, AlertCircle, FileArchive,
-  ChevronDown, ChevronUp, ExternalLink, ArrowLeft,
+  ChevronDown, ChevronUp, ExternalLink, ArrowLeft, Github,
 } from 'lucide-react';
 import { db } from '../../db/database';
 import { parseCrashZip } from '../../lib/crashParser';
+import {
+  isGitHubConfigured,
+  loadCrashesFromGitHub,
+  pushCrashes,
+} from '../../lib/githubStorage';
 import FileDropzone from '../FileDropzone';
 import type { CrashAnalysis, StoredCrash } from '../../types';
 
@@ -257,13 +262,27 @@ function CrashResult({ crash, onSave, onReset, saving, alreadySaved }: {
 
 // ─── Tab principal ────────────────────────────────────────────────────────────
 export default function CrashAnalyzer() {
-  const [crash,   setCrash]   = useState<CrashAnalysis | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error,   setError]   = useState<string | null>(null);
-  const [saving,  setSaving]  = useState(false);
-  const [savedId, setSavedId] = useState<number | null>(null);
+  const [crash,     setCrash]     = useState<CrashAnalysis | null>(null);
+  const [loading,   setLoading]   = useState(false);
+  const [error,     setError]     = useState<string | null>(null);
+  const [saving,    setSaving]    = useState(false);
+  const [savedId,   setSavedId]   = useState<number | null>(null);
+  const [ghSyncing, setGhSyncing] = useState(false);
 
   const savedCrashes = useLiveQuery(() => db.crashes.orderBy('uploadedAt').reverse().toArray(), []);
+
+  // Al montar: si GitHub configurado, carga datos y sincroniza Dexie
+  useEffect(() => {
+    if (!isGitHubConfigured()) return;
+    loadCrashesFromGitHub().then(async (ghCrashes) => {
+      if (ghCrashes.length === 0) return;
+      await db.crashes.clear();
+      for (const c of ghCrashes) {
+        const { id: _, ...data } = c;
+        await db.crashes.add(data as StoredCrash);
+      }
+    }).catch(() => {});
+  }, []);
 
   async function handleFile(file: File) {
     setLoading(true);
@@ -286,6 +305,13 @@ export default function CrashAnalyzer() {
     try {
       const id = await db.crashes.add({ ...crash });
       setSavedId(id as number);
+      if (isGitHubConfigured()) {
+        setGhSyncing(true);
+        db.crashes.orderBy('uploadedAt').reverse().toArray()
+          .then(pushCrashes)
+          .catch(() => {})
+          .finally(() => setGhSyncing(false));
+      }
     } catch {
       setError('Error al guardar en la base de datos.');
     } finally {
@@ -296,6 +322,13 @@ export default function CrashAnalyzer() {
   async function handleDelete(id: number) {
     await db.crashes.delete(id);
     if (savedId === id) setSavedId(null);
+    if (isGitHubConfigured()) {
+      setGhSyncing(true);
+      db.crashes.orderBy('uploadedAt').reverse().toArray()
+        .then(pushCrashes)
+        .catch(() => {})
+        .finally(() => setGhSyncing(false));
+    }
   }
 
   function handleReset() {
@@ -306,6 +339,15 @@ export default function CrashAnalyzer() {
 
   return (
     <div className="space-y-8">
+
+      {/* Indicador sync GitHub */}
+      {ghSyncing && (
+        <div className="flex items-center gap-2 text-xs text-zinc-500 justify-end">
+          <Loader2 className="h-3 w-3 animate-spin" />
+          <Github className="h-3 w-3" />
+          Sincronizando con GitHub…
+        </div>
+      )}
 
       {/* ── Estado inicial ── */}
       {!crash && !loading && (

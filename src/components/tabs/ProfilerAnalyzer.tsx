@@ -1,8 +1,13 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
-import { Loader2, Save, Trash2, ChevronDown, ChevronUp, AlertCircle } from 'lucide-react';
+import { Loader2, Save, Trash2, ChevronDown, ChevronUp, AlertCircle, Github } from 'lucide-react';
 import { db } from '../../db/database';
 import { parseProfilerFile } from '../../lib/profilerParser';
+import {
+  isGitHubConfigured,
+  loadProfilesFromGitHub,
+  pushProfiles,
+} from '../../lib/githubStorage';
 import FileDropzone from '../FileDropzone';
 import GradeBadge from '../GradeBadge';
 import TickTimeline from '../TickTimeline';
@@ -249,12 +254,27 @@ function SavedProfileRow({
 // ─── Main tab ─────────────────────────────────────────────────────────────────
 export default function ProfilerAnalyzer() {
   const [analysis, setAnalysis] = useState<ProfileAnalysis | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [savedId, setSavedId] = useState<number | null>(null);
+  const [loading,  setLoading]  = useState(false);
+  const [error,    setError]    = useState<string | null>(null);
+  const [saving,   setSaving]   = useState(false);
+  const [savedId,  setSavedId]  = useState<number | null>(null);
+  const [ghSyncing, setGhSyncing] = useState(false);
 
   const savedProfiles = useLiveQuery(() => db.profiles.orderBy('uploadedAt').reverse().toArray(), []);
+
+  // Al montar: si GitHub configurado, carga datos y sincroniza Dexie
+  useEffect(() => {
+    if (!isGitHubConfigured()) return;
+    loadProfilesFromGitHub().then(async (ghProfiles) => {
+      if (ghProfiles.length === 0) return;
+      // Reemplaza Dexie con los datos de GitHub
+      await db.profiles.clear();
+      for (const p of ghProfiles) {
+        const { id: _, ...data } = p;
+        await db.profiles.add(data as StoredProfile);
+      }
+    }).catch(() => { /* silencioso si no hay conexión */ });
+  }, []);
 
   async function handleFile(file: File) {
     setLoading(true);
@@ -279,7 +299,15 @@ export default function ProfilerAnalyzer() {
     try {
       const id = await db.profiles.add({ ...analysis });
       setSavedId(id as number);
-    } catch (e) {
+      // Sync GitHub en background
+      if (isGitHubConfigured()) {
+        setGhSyncing(true);
+        db.profiles.orderBy('uploadedAt').reverse().toArray()
+          .then(pushProfiles)
+          .catch(() => {})
+          .finally(() => setGhSyncing(false));
+      }
+    } catch {
       setError('Error al guardar en la base de datos.');
     } finally {
       setSaving(false);
@@ -289,6 +317,14 @@ export default function ProfilerAnalyzer() {
   async function handleDelete(id: number) {
     await db.profiles.delete(id);
     if (savedId === id) setSavedId(null);
+    // Sync GitHub en background
+    if (isGitHubConfigured()) {
+      setGhSyncing(true);
+      db.profiles.orderBy('uploadedAt').reverse().toArray()
+        .then(pushProfiles)
+        .catch(() => {})
+        .finally(() => setGhSyncing(false));
+    }
   }
 
   function loadSaved(profile: StoredProfile) {
@@ -300,6 +336,15 @@ export default function ProfilerAnalyzer() {
 
   return (
     <div className="space-y-8">
+      {/* Indicador sync GitHub */}
+      {ghSyncing && (
+        <div className="flex items-center gap-2 text-xs text-zinc-500 justify-end">
+          <Loader2 className="h-3 w-3 animate-spin" />
+          <Github className="h-3 w-3" />
+          Sincronizando con GitHub…
+        </div>
+      )}
+
       {/* Hero */}
       {!analysis && !loading && (
         <div className="text-center py-4">
