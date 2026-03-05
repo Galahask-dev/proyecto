@@ -329,6 +329,7 @@ export default function ProfilerAnalyzer() {
     }
 
     const analyses: ProfileAnalysis[] = [];
+    const skippedErrors: string[] = [];
     setZipProgress({ current: 0, total: entries.length, currentFile: '' });
 
     for (let i = 0; i < entries.length; i++) {
@@ -340,13 +341,19 @@ export default function ProfilerAnalyzer() {
         const buffer = await zipEntry.async('arraybuffer');
         const result = await runWorker(buffer, baseName);
         analyses.push(result);
-      } catch {
-        // Skip non-profiler files silently
+      } catch (err) {
+        skippedErrors.push(err instanceof Error ? err.message : String(err));
       }
     }
 
     if (analyses.length === 0) {
-      throw new Error('Ningún archivo en el ZIP pudo ser analizado como profiler de FiveM.');
+      const detail = skippedErrors.length > 0
+        ? '\n\n' + skippedErrors.slice(0, 5).join('\n') +
+          (skippedErrors.length > 5 ? `\n… y ${skippedErrors.length - 5} más.` : '')
+        : '';
+      throw new Error(
+        `Ningún archivo en el ZIP pudo ser analizado como profiler de FiveM.${detail}`,
+      );
     }
 
     setZipProgress({ current: entries.length, total: entries.length, currentFile: '' });
