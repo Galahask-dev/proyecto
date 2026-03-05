@@ -3,6 +3,7 @@ import { useLiveQuery } from 'dexie-react-hooks';
 import { Loader2, Save, Trash2, ChevronDown, ChevronUp, AlertCircle, Github } from 'lucide-react';
 import { db } from '../../db/database';
 import { mergeAnalyses } from '../../lib/profilerParser';
+import ProfilerWorker from '../../lib/profilerWorker?worker';
 import {
   isGitHubConfigured,
   loadProfilesFromGitHub,
@@ -280,16 +281,13 @@ export default function ProfilerAnalyzer() {
   // ── Spawn a short-lived worker so large files don't freeze the UI ──────────
   function runWorker(buffer: ArrayBuffer, fileName: string): Promise<ProfileAnalysis> {
     return new Promise((resolve, reject) => {
-      const worker = new Worker(
-        new URL('../../lib/profilerWorker.ts', import.meta.url),
-        { type: 'module' },
-      );
+      const worker = new ProfilerWorker();
       worker.onmessage = (e: MessageEvent<{ ok: boolean; result?: ProfileAnalysis; error?: string }>) => {
         worker.terminate();
         if (e.data.ok && e.data.result) resolve(e.data.result);
         else reject(new Error(e.data.error ?? 'Worker error'));
       };
-      worker.onerror = (e) => {
+      worker.onerror = (e: ErrorEvent) => {
         worker.terminate();
         reject(new Error(e.message || 'Worker error'));
       };
